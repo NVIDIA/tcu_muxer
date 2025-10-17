@@ -295,12 +295,16 @@ int flush_stream(int fd, int pty_idx, unsigned char ch)
             if ('\n' == pty_data[pty_idx].last_ch || '\0' == pty_data[pty_idx].last_ch) {
                 len_ts = get_timestamp(timestamp, sizeof timestamp);
                 if (0 < len_ts && len_ts < sizeof timestamp)
-                    write(pty_data[pty_idx].log_fd, timestamp, len_ts);
+                    if( write(pty_data[pty_idx].log_fd, timestamp, len_ts) < 0){
+                        return -2;
+                    }
             }
             pty_data[pty_idx].last_ch = ch;
         }
 
-        write(pty_data[pty_idx].log_fd, &ch, 1);
+        if (write(pty_data[pty_idx].log_fd, &ch, 1) < 0){
+            return -3;
+        }
     }
 
     // write to pty path
@@ -423,7 +427,10 @@ ut_static int uucp_lock_tty_device(void)
         close(fd);
         return -1;
     }
-    write(fd, buf, strlen(buf));
+    if (write(fd, buf, strlen(buf)) < 0){
+        close(fd);
+        return -2;
+    }
     close(fd);
 
     signal(SIGINT, handle_sigint);
@@ -605,8 +612,12 @@ void* tty_input_handler(void *arg)
             fprintf(stderr, "ERROR: failed to read\n");
             goto out;
         }
-        if (tty_data.log_fd >= 0)
-            write(tty_data.log_fd, buf, len);
+        if (tty_data.log_fd >= 0){
+            if (write(tty_data.log_fd, buf, len) < 0){
+                fprintf(stderr, "ERROR: failed to write\n");
+                goto out;
+            }
+        }
 
         for (index = 0; index < len; index++) {
             ch = buf[index];
