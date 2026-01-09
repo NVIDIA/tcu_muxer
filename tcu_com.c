@@ -74,6 +74,8 @@ int uucp_lock_tty_device(void);
 #define DEFAULT_TTY_DEVICE "/dev/ttyUSB3"
 #define UUCP_DIR "/var/lock"
 #define RAW_PTY "RAW"
+#define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
+#define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
 
 ut_static bool tcu_muxer_started = true; // Needed to exit endless while loops during testing
 ut_static const char* tty_device = DEFAULT_TTY_DEVICE;
@@ -175,6 +177,7 @@ void* pty_input_handler(void* arg);
 void print_usage(char *argv[]);
 int invalid_baudrate(int baudrate);
 speed_t get_baudrate(int baudrate);
+int create_thread_with_stack(pthread_t *thread, void *(*start_routine)(void *), void *arg);
 
 struct thread_data
 {
@@ -696,6 +699,8 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
     size_t data_index;
     ssize_t r;
     size_t encoded_buf_index = 0;
+    size_t processed = 0;
+    size_t chunk_size;
 
     if (pty_idx >= pty_max_count) {
         fprintf(stderr, "ERROR: Invalid pty\n");
@@ -703,10 +708,11 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
     }
 
     /*
-     * At most three escape bytes are sent for each byte in the buf and
-     * a few more bytes for tag.
+     * Process data in chunks to limit memory allocation.
+     * Maximum encoded buffer size: MAX_WRITE_CHUNK_SIZE * 4 + 16
+     * This prevents excessive memory usage for large writes.
      */
-    const size_t max_encoded_buf_len = len * 4 + 16;
+    const size_t max_encoded_buf_len = MAX_WRITE_CHUNK_SIZE * 4 + 16;
     unsigned char *encoded_buf = malloc(max_encoded_buf_len);
     if (!encoded_buf) {
         fprintf(stderr, "ERROR: Failed to allocate %zu bytes.\n", max_encoded_buf_len);
@@ -726,26 +732,34 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
         encoded_buf[encoded_buf_index++] = (x);                          \
     } while (0)
 
-    if (pty_idx != raw_pty_idx) {
-        WRITE_BYTE_TO_ENCODED_BUF(esc);
-        WRITE_BYTE_TO_ENCODED_BUF(tags[pty_idx].value);
-    }
-        
-
-    for (data_index = 0; data_index < len; data_index++) {
-        // send data
-        WRITE_BYTE_TO_ENCODED_BUF(data[data_index]);
-        if (data[data_index] == esc && pty_idx != raw_pty_idx) {
-            WRITE_BYTE_TO_ENCODED_BUF(esc_esc);
-        }
-    }
-
     pthread_mutex_lock(&tty_data.write_lock);
 
-    r = putbuf_or_exit(tty_data.fd, encoded_buf, encoded_buf_index);
-    if (r < 0) {
-        fprintf(stderr, "ERROR: Failed to write buffer. Error: %zd\n", r);
-        goto fail;
+    while (processed < len) {
+        encoded_buf_index = 0;
+        chunk_size = (len - processed > MAX_WRITE_CHUNK_SIZE) ? 
+                     MAX_WRITE_CHUNK_SIZE : (len - processed);
+
+        /* Add tag header only for the first chunk of non-raw PTY */
+        if (processed == 0 && pty_idx != raw_pty_idx) {
+            WRITE_BYTE_TO_ENCODED_BUF(esc);
+            WRITE_BYTE_TO_ENCODED_BUF(tags[pty_idx].value);
+        }
+
+        for (data_index = 0; data_index < chunk_size; data_index++) {
+            // send data
+            WRITE_BYTE_TO_ENCODED_BUF(data[processed + data_index]);
+            if (data[processed + data_index] == esc && pty_idx != raw_pty_idx) {
+                WRITE_BYTE_TO_ENCODED_BUF(esc_esc);
+            }
+        }
+
+        r = putbuf_or_exit(tty_data.fd, encoded_buf, encoded_buf_index);
+        if (r < 0) {
+            fprintf(stderr, "ERROR: Failed to write buffer. Error: %zd\n", r);
+            goto fail;
+        }
+
+        processed += chunk_size;
     }
 
     pthread_mutex_unlock(&tty_data.write_lock);
@@ -888,6 +902,35 @@ int invalid_baudrate(int baudrate)
 {
     if((int)get_baudrate(baudrate) == -1)
         return 1;
+    return 0;
+}
+
+int create_thread_with_stack(pthread_t *thread, void *(*start_routine)(void *), void *arg)
+{
+    pthread_attr_t attr;
+    int ret;
+
+    ret = pthread_attr_init(&attr);
+    if (ret != 0) {
+        fprintf(stderr, "ERROR: pthread_attr_init failed: %s\n", strerror(ret));
+        return ret;
+    }
+
+    ret = pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE);
+    if (ret != 0) {
+        fprintf(stderr, "ERROR: pthread_attr_setstacksize failed: %s\n", strerror(ret));
+        pthread_attr_destroy(&attr);
+        return ret;
+    }
+
+    ret = pthread_create(thread, &attr, start_routine, arg);
+    if (ret != 0) {
+        fprintf(stderr, "ERROR: pthread_create failed: %s\n", strerror(ret));
+        pthread_attr_destroy(&attr);
+        return ret;
+    }
+
+    pthread_attr_destroy(&attr);
     return 0;
 }
 
@@ -1084,14 +1127,14 @@ int main(int argc, char *argv[])
 
     fflush(stdout);
 
-    if (pthread_create(&tty_thread, NULL, tty_input_handler, &tty_data)) {
-        fprintf(stderr, "ERROR: failed to spawn thread\n");
+    if (create_thread_with_stack(&tty_thread, tty_input_handler, &tty_data)) {
+        fprintf(stderr, "ERROR: failed to spawn tty thread\n");
         goto err;
     }
 
     for_each_pty(i, pty) {
-        if (pthread_create(&pty_thread[i], NULL, pty_input_handler, pty)) {
-            fprintf(stderr, "ERROR: failed to spawn thread\n");
+        if (create_thread_with_stack(&pty_thread[i], pty_input_handler, pty)) {
+            fprintf(stderr, "ERROR: failed to spawn pty thread %d\n", i);
             goto err;
         }
     }
