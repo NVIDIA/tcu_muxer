@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,6 +86,7 @@ ut_static bool uucp_locked = false;
 ut_static char filelock[MAX_PATH];
 static int poll_output_timeout = DEFAULT_POLL_OUTPUT_TIMEOUT;
 static char path[MAX_PATH];
+static bool enable_write_raw_pty = false;
 
 struct tag {
     char *name;
@@ -94,7 +95,7 @@ struct tag {
 
 const struct tag chip_tags[] = {
     {
-        .name = "PSCFW",
+        .name = "PSC",
         .value = 0xe1
     },
     {
@@ -102,15 +103,15 @@ const struct tag chip_tags[] = {
         .value = 0xe2
     },
     {
-        .name = "OOBHUBFW",
+        .name = "OOBHUB",
         .value = 0xe3
     },
     {
-        .name = "SatMCFW",
+        .name = "SatMC",
         .value = 0xe4
     },
     {
-        .name = "RASFW",
+        .name = "RAS",
         .value = 0xe5
     },
     {
@@ -126,15 +127,15 @@ const struct tag chip_tags[] = {
         .value = 0xe8
     },
     {
-        .name = "MSEQFW",
+        .name = "MSEQ",
         .value = 0xea
     },
     {
-        .name = "PCOREFW",
+        .name = "PCORE",
         .value = 0xeb
     },
     {
-        .name = "C2CFW",
+        .name = "C2C",
         .value = 0xec
     },
     {
@@ -142,11 +143,11 @@ const struct tag chip_tags[] = {
         .value = 0xed
     },
     {
-        .name = "NCORE",
+        .name = "RSVD15",
         .value = 0xef
     },
     {
-        .name = "NPXIR",
+        .name = "RSVD16",
         .value = 0xf0
     },
     {
@@ -701,10 +702,19 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
     size_t encoded_buf_index = 0;
     size_t processed = 0;
     size_t chunk_size;
+    static bool write_raw_pty_warning_shown = false;
 
     if (pty_idx >= pty_max_count) {
         fprintf(stderr, "ERROR: Invalid pty\n");
         return -EINVAL;
+    }
+
+    if (pty_idx == raw_pty_idx && !enable_write_raw_pty) {
+        if (!write_raw_pty_warning_shown) {
+            fprintf(stderr, "WARNING: Writing to RAW client is disabled. Use -w to enable.\n");
+            write_raw_pty_warning_shown = true;
+        }
+        return 0;
     }
 
     /*
@@ -956,6 +966,8 @@ void print_usage(char *argv[])
             "Set the timeout for output polling ready status. Default: %d\n", DEFAULT_POLL_OUTPUT_TIMEOUT);
     fprintf(stderr, "\t -l <path>: "
             "Save the raw output with tags to log file <path>\n");
+    fprintf(stderr, "\t -w       : "
+            "Enable writing to RAW client\n");
 }
 
 int main(int argc, char *argv[])
@@ -971,7 +983,7 @@ int main(int argc, char *argv[])
     size_t len;
     struct thread_data *pty;
 
-    while ((opt = getopt(argc, argv, ":d:r:s:l:p:hit")) != -1) {
+    while ((opt = getopt(argc, argv, ":d:r:s:l:p:hitw")) != -1) {
         switch (opt)
         {
             case 'd':
@@ -1002,6 +1014,9 @@ int main(int argc, char *argv[])
                 break;
             case 't':
                 log_timestamp_enabled = true;
+                break;
+            case 'w':
+                enable_write_raw_pty = true;
                 break;
             case 'p':
                 poll_output_timeout = atoi(optarg);
