@@ -34,6 +34,8 @@
 #include <string.h>
 #include <dirent.h>
 #include <signal.h>
+#include <stdint.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -166,6 +168,20 @@ ut_static char* save_output_path = NULL;
 
 ut_static const size_t temporary_buffer_size = 1024;
 
+#define TIMESTAMP_ESC_START 1
+#define TIMESTAMP_ESC_CSI 2
+
+struct muxer_log {
+    int fd;
+    size_t size;
+    size_t maxsize;
+    char *filename;
+    char *rotate_filename;
+    unsigned char last_ch;
+    bool timestamp_pending;
+    int timestamp_escape_state;
+};
+
 // prototype
 bool should_retry_io(ssize_t ret);
 int putch_or_exit(int fd, const unsigned char ch);
@@ -183,11 +199,10 @@ int create_thread_with_stack(pthread_t *thread, void *(*start_routine)(void *), 
 struct thread_data
 {
     int fd;
-    int log_fd;
+    struct muxer_log log;
     unsigned int id;
     pthread_mutex_t write_lock;
     char device_name[128];
-    char last_ch;
 };
 
 struct thread_data tty_data;
@@ -198,6 +213,261 @@ struct thread_data *pty_data;
 
 #define for_each_pty(i, pty) \
     for (i = 0, pty = &pty_data[i]; i < pty_max_count; i++, pty++)
+
+static void muxer_log_init(struct muxer_log *log)
+{
+    log->fd = -1;
+    log->size = 0;
+    log->maxsize = 0;
+    log->filename = NULL;
+    log->rotate_filename = NULL;
+    log->last_ch = '\0';
+    log->timestamp_pending = false;
+    log->timestamp_escape_state = 0;
+}
+
+static void muxer_log_close(struct muxer_log *log)
+{
+    if (log->fd >= 0)
+        close(log->fd);
+    log->fd = -1;
+    free(log->filename);
+    free(log->rotate_filename);
+    log->filename = NULL;
+    log->rotate_filename = NULL;
+}
+
+static int parse_log_size(const char *size_str, size_t *size)
+{
+    size_t logsize;
+    char *suffix;
+    size_t shift = 0;
+
+    if (!size_str)
+        return -1;
+
+    errno = 0;
+    logsize = strtoul(size_str, &suffix, 0);
+    if (errno || logsize == 0 || logsize >= UINT32_MAX ||
+            suffix == size_str) {
+        return -1;
+    }
+
+    while (*suffix && isspace((unsigned char)*suffix))
+        suffix++;
+
+    if (*suffix == 'k')
+        shift = 10;
+    else if (*suffix == 'M')
+        shift = 20;
+    else if (*suffix == 'G')
+        shift = 30;
+
+    if (shift) {
+        if (logsize > (UINT32_MAX >> shift))
+            return -1;
+        logsize <<= shift;
+        suffix++;
+    }
+
+    while (*suffix && (tolower((unsigned char)*suffix) == 'b' ||
+                isspace((unsigned char)*suffix))) {
+        suffix++;
+    }
+
+    if (*suffix)
+        return -1;
+
+    *size = logsize;
+    return 0;
+}
+
+static int muxer_log_rotate(struct muxer_log *log)
+{
+    int rc, old_fd = log->fd;
+
+    rc = rename(log->filename, log->rotate_filename);
+    if (rc) {
+        fprintf(stderr, "WARNING: failed to rename %s to %s: %s\n",
+                log->filename, log->rotate_filename, strerror(errno));
+        /* Re-open in append mode to avoid data loss */
+        log->fd = open(log->filename, O_WRONLY | O_CREAT | O_APPEND,
+                       S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+        if (log->fd < 0) {
+            fprintf(stderr, "ERROR: log file open failed: %s: %s\n",
+                    log->filename, strerror(errno));
+            log->fd = old_fd;  /* Restore old fd */
+            return -1;
+        }
+        if (old_fd >= 0)
+            close(old_fd);
+        /* Keep existing size since we're appending */
+        return 0;
+    }
+
+    log->fd = open(log->filename, O_WRONLY | O_CREAT | O_TRUNC,
+                   S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    if (log->fd < 0) {
+        fprintf(stderr, "ERROR: log file open failed: %s: %s\n",
+                log->filename, strerror(errno));
+        log->fd = old_fd;  /* Restore old fd */
+        return -1;
+    }
+    if (old_fd >= 0)
+        close(old_fd);
+
+    log->size = 0;
+    log->last_ch = '\0';
+    log->timestamp_pending = false;
+    log->timestamp_escape_state = 0;
+    return 0;
+}
+
+static int muxer_log_open(struct muxer_log *log, const char *filename,
+                          size_t maxsize)
+{
+    off_t pos;
+
+    muxer_log_init(log);
+    log->maxsize = maxsize;
+    log->filename = strdup(filename);
+    if (!log->filename)
+        goto err;
+
+    if (asprintf(&log->rotate_filename, "%s.1", filename) < 0) {
+        log->rotate_filename = NULL;
+        goto err;
+    }
+
+    log->fd = open(log->filename, O_CREAT | O_APPEND | O_WRONLY,
+                   S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    if (log->fd < 0) {
+        fprintf(stderr, "ERROR: log file open failed: %s: %s\n",
+                log->filename, strerror(errno));
+        goto err;
+    }
+
+    if (!log->maxsize)
+        return 0;
+
+    pos = lseek(log->fd, 0, SEEK_END);
+    if (pos < 0) {
+        fprintf(stderr, "ERROR: failed to query log file size: %s: %s\n",
+                log->filename, strerror(errno));
+        goto err;
+    }
+
+    log->size = (size_t)pos;
+    if (log->size >= log->maxsize) {
+        if (muxer_log_rotate(log))
+            goto err;
+    }
+
+    return 0;
+
+err:
+    muxer_log_close(log);
+    return -1;
+}
+
+static int muxer_log_write(struct muxer_log *log, const void *buf, size_t len)
+{
+    const unsigned char *data = buf;
+    size_t written = 0;
+    ssize_t ret;
+
+    if (log->fd < 0 || len == 0)
+        return 0;
+
+    if (log->maxsize) {
+        if (len > log->maxsize) {
+            data += len - log->maxsize;
+            len = log->maxsize;
+        }
+
+        if (log->size > log->maxsize - len) {
+            if (muxer_log_rotate(log))
+                return -1;
+        }
+    }
+
+    while (written < len) {
+        ret = write(log->fd, data + written, len - written);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (ret == 0)
+            return -1;
+        written += (size_t)ret;
+    }
+
+    log->size += len;
+    return 0;
+}
+
+static int muxer_log_write_char(struct muxer_log *log, unsigned char ch)
+{
+    char timestamp[30];
+    char logbuf[sizeof(timestamp) + 1];
+    size_t len_ts = 0;
+    size_t log_len = 0;
+
+    if (!log_timestamp_enabled) {
+        if (muxer_log_write(log, &ch, 1) < 0)
+            return -1;
+        log->last_ch = ch;
+        return 0;
+    }
+
+    if (!log->timestamp_pending &&
+            (log->last_ch == '\n' || log->last_ch == '\r' ||
+             log->last_ch == '\0')) {
+        log->timestamp_pending = true;
+    }
+
+    if (log->timestamp_pending) {
+        if (log->timestamp_escape_state) {
+            if (muxer_log_write(log, &ch, 1) < 0)
+                return -1;
+            if (log->timestamp_escape_state == TIMESTAMP_ESC_START)
+                log->timestamp_escape_state =
+                    (ch == '[') ? TIMESTAMP_ESC_CSI : 0;
+            else if (ch >= 0x40 && ch <= 0x7e)
+                log->timestamp_escape_state = 0;
+            log->last_ch = ch;
+            return 0;
+        }
+
+        if (ch == '\033')
+            log->timestamp_escape_state = TIMESTAMP_ESC_START;
+
+        if (ch == '\033' || ch == '\r' || ch == '\n') {
+            if (muxer_log_write(log, &ch, 1) < 0)
+                return -1;
+            if (ch == '\n')
+                log->timestamp_pending = false;
+            log->last_ch = ch;
+            return 0;
+        }
+
+        len_ts = get_timestamp(timestamp, sizeof timestamp);
+        if (0 < len_ts && len_ts < sizeof timestamp) {
+            memcpy(logbuf, timestamp, len_ts);
+            log_len += len_ts;
+        }
+        log->timestamp_pending = false;
+    }
+
+    logbuf[log_len++] = ch;
+    if (muxer_log_write(log, logbuf, log_len) < 0)
+        return -1;
+
+    log->last_ch = ch;
+
+    return 0;
+}
 
 
 bool should_retry_io(ssize_t ret)
@@ -281,24 +551,19 @@ int putch_or_exit(int fd, const unsigned char ch)
 
 size_t get_timestamp(char *buf, const size_t maxsize)
 {
-    /* 'tsfmt' stores 28 chars: "[YYYY-mm-dd HH:MM:SS.%06u] \0" */
-    /* resize 'fmt' accordingly when changing the timestamp format 'tsfmt' */
-    const char tsfmt[] = "[%Y-%m-%d %H:%M:%S.%%06u] ";
-    char fmt[28];
-
     struct timeval tv;
-    struct tm *tm = NULL;
+    struct tm tm;
     int len = 0;
 
-    if (buf && maxsize && !gettimeofday(&tv, NULL) && (tm = localtime(&tv.tv_sec))) {
-        if (strftime(fmt, sizeof fmt, tsfmt, tm)) {
-            /* fill in microseconds */
-            len = snprintf(buf, maxsize, fmt, tv.tv_usec);
-            if (0 < len && len < (int)maxsize ) {
-                /* len should less than maxsize since at least one byte */
-                /* must be reserved for the terminating null character */
-                return (size_t)len;
-            }
+    if (buf && maxsize && !gettimeofday(&tv, NULL) &&
+            localtime_r(&tv.tv_sec, &tm)) {
+        len = snprintf(buf, maxsize, "[%04d-%02d-%02d %02d:%02d:%02d.%06ld] ",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec, (long)tv.tv_usec);
+        if (0 < len && len < (int)maxsize ) {
+            /* len should less than maxsize since at least one byte */
+            /* must be reserved for the terminating null character */
+            return (size_t)len;
         }
     }
     return 0;
@@ -306,24 +571,8 @@ size_t get_timestamp(char *buf, const size_t maxsize)
 
 int flush_stream(int fd, int pty_idx, unsigned char ch)
 {
-    char timestamp[30];
-    size_t len_ts = 0;
-    /* 'timestamp' stores 30 chars: "[YYYY-mm-dd HH:MM:SS.ssssss] \0" */
-    /* resize it accordingly when changing the timestamp format */
-
-    if ((pty_idx < pty_max_count) && pty_data[pty_idx].log_fd >= 0) {
-        if (log_timestamp_enabled) {
-            if ('\n' == pty_data[pty_idx].last_ch || '\0' == pty_data[pty_idx].last_ch) {
-                len_ts = get_timestamp(timestamp, sizeof timestamp);
-                if (0 < len_ts && len_ts < sizeof timestamp)
-                    if( write(pty_data[pty_idx].log_fd, timestamp, len_ts) < 0){
-                        return -2;
-                    }
-            }
-            pty_data[pty_idx].last_ch = ch;
-        }
-
-        if (write(pty_data[pty_idx].log_fd, &ch, 1) < 0){
+    if ((pty_idx < pty_max_count) && pty_data[pty_idx].log.fd >= 0) {
+        if (muxer_log_write_char(&pty_data[pty_idx].log, ch) < 0) {
             return -3;
         }
     }
@@ -633,8 +882,8 @@ void* tty_input_handler(void *arg)
             fprintf(stderr, "ERROR: failed to read\n");
             goto out;
         }
-        if (tty_data.log_fd >= 0){
-            if (write(tty_data.log_fd, buf, len) < 0){
+        if (tty_data.log.fd >= 0) {
+            if (muxer_log_write(&tty_data.log, buf, (size_t)len) < 0) {
                 fprintf(stderr, "ERROR: failed to write\n");
                 goto out;
             }
@@ -746,7 +995,7 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
 
     while (processed < len) {
         encoded_buf_index = 0;
-        chunk_size = (len - processed > MAX_WRITE_CHUNK_SIZE) ? 
+        chunk_size = (len - processed > MAX_WRITE_CHUNK_SIZE) ?
                      MAX_WRITE_CHUNK_SIZE : (len - processed);
 
         /* Add tag header only for the first chunk of non-raw PTY */
@@ -966,6 +1215,8 @@ void print_usage(char *argv[])
             "Set the timeout for output polling ready status. Default: %d\n", DEFAULT_POLL_OUTPUT_TIMEOUT);
     fprintf(stderr, "\t -l <path>: "
             "Save the raw output with tags to log file <path>\n");
+    fprintf(stderr, "\t -z <size>: "
+            "Set max log file size before rotation. Supports k, M, G suffixes\n");
     fprintf(stderr, "\t -w       : "
             "Enable writing to RAW client\n");
 }
@@ -973,6 +1224,7 @@ void print_usage(char *argv[])
 int main(int argc, char *argv[])
 {
     char *raw_log_file_path = NULL;
+    size_t max_log_size = 0;
 
     pthread_t tty_thread;
     pthread_t *pty_thread;
@@ -983,7 +1235,7 @@ int main(int argc, char *argv[])
     size_t len;
     struct thread_data *pty;
 
-    while ((opt = getopt(argc, argv, ":d:r:s:l:p:hitw")) != -1) {
+    while ((opt = getopt(argc, argv, ":d:r:s:l:z:p:hitw")) != -1) {
         switch (opt)
         {
             case 'd':
@@ -1005,6 +1257,12 @@ int main(int argc, char *argv[])
                 break;
             case 'l':
                 raw_log_file_path = optarg;
+                break;
+            case 'z':
+                if (parse_log_size(optarg, &max_log_size)) {
+                    fprintf(stderr, "ERROR: invalid log size: %s\n", optarg);
+                    return -1;
+                }
                 break;
             case 'h':
                 print_usage(argv);
@@ -1042,6 +1300,8 @@ int main(int argc, char *argv[])
     pty_max_count = num_proc + 1;
     raw_pty_idx = pty_max_count - 1; // last pty is the raw pty
 
+    muxer_log_init(&tty_data.log);
+
     pty_thread = malloc(sizeof(pthread_t) * pty_max_count);
     pty_data = malloc(sizeof(struct thread_data) * pty_max_count);
 
@@ -1063,17 +1323,14 @@ int main(int argc, char *argv[])
     }
 
     if (raw_log_file_path) {
-        tty_data.log_fd = open(raw_log_file_path, O_CREAT|O_APPEND|O_WRONLY,
-                               S_IRUSR|S_IRGRP|S_IROTH|S_IWUSR);
-        if (tty_data.log_fd < 0)
+        if (muxer_log_open(&tty_data.log, raw_log_file_path, max_log_size))
             fprintf(stderr, "ERROR: raw log file open failed!\n");
-    } else {
-        tty_data.log_fd = -1;
     }
 
 #ifdef UNIT_TEST
     // Exit main early if only testing argument parsing.
     if(ut_main_args_done()) {
+        muxer_log_close(&tty_data.log);
         uucp_unlock_tty_device();
         return 0;
     }
@@ -1085,7 +1342,10 @@ int main(int argc, char *argv[])
     // create pseudo-terminals and thread locks
     for_each_pty(i, pty) {
         char *name = NULL;
+        int ret;
         int fd = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK);
+
+        muxer_log_init(&pty->log);
 
         if (fd < 0) {
             fprintf(stderr, "ERROR: posix_openpt failed for guest %d\n", i);
@@ -1112,14 +1372,14 @@ int main(int argc, char *argv[])
         if (save_output_path) {
             char savefile[1024];
             // generate save file name and path
-            snprintf(savefile, sizeof(savefile), "%s/%s", save_output_path, name);
-            strncat(savefile, ".txt", sizeof(savefile) - strlen(savefile) - 1);
-            pty->log_fd = open(savefile, O_APPEND|O_CREAT|O_WRONLY,
-                                      S_IRUSR|S_IRGRP|S_IROTH|S_IWUSR);
-            if (pty->log_fd < 0)
+            ret = snprintf(savefile, sizeof(savefile), "%s/%s.txt",
+                           save_output_path, name);
+            if (ret < 0 || (size_t)ret >= sizeof(savefile)) {
+                fprintf(stderr, "ERROR: logfile path too long for %s\n", name);
+                goto err;
+            }
+            if (muxer_log_open(&pty->log, savefile, max_log_size))
                 fprintf(stderr, "ERROR: logfile: %s open failed!\n", savefile);
-        } else {
-            pty->log_fd = -1;
         }
         ptsname_r(fd, pty->device_name,
                   sizeof(pty->device_name));
@@ -1166,12 +1426,10 @@ int main(int argc, char *argv[])
 
     // flock will get released automatically when we close tty fd
     close(tty_data.fd);
-    if (raw_log_file_path && tty_data.log_fd >= 0)
-        close(tty_data.log_fd);
+    muxer_log_close(&tty_data.log);
     for_each_pty(i, pty) {
         close(pty->fd);
-        if (save_output_path && pty->log_fd >= 0)
-            close(pty->log_fd);
+        muxer_log_close(&pty->log);
     }
     uucp_unlock_tty_device();
     return 0;
