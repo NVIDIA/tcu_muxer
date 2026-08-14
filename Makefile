@@ -7,13 +7,21 @@ CFLAGS += -Wreturn-type -Wmultichar  -Wunused -Wmissing-braces -Werror
 CFLAGS += -Wno-missing-field-initializers
 
 CEXTRA = -pthread -std=gnu99
-SOURCES = tcu_com.c
+SOURCES = tcu_com.c raw_capture.c
 
 all: tcu_muxer
 
-tcu_muxer: tcu_com.c
-	$(CC) $(CFLAGS) $(CEXTRA) tcu_com.c -o tcu_muxer
+check: tcu_muxer_integration
+	python3 tests/test_physical_uart_hup.py ./tcu_muxer_integration
+
+tcu_muxer: $(SOURCES)
+	$(CC) $(CFLAGS) $(CEXTRA) $(SOURCES) -o tcu_muxer
+
+# Host-side integration tests cannot create UUCP locks in /var/lock. Compile
+# the identical muxer with only its lock directory redirected to /tmp.
+tcu_muxer_integration: $(SOURCES)
+	$(CC) $(CFLAGS) $(CEXTRA) -DUUCP_DIR='"/tmp"' $(SOURCES) -o $@
 
 clean:
 	rm -f *.o
-	rm -f tcu_muxer
+	rm -f tcu_muxer tcu_muxer_integration
