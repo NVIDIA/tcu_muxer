@@ -182,3 +182,37 @@ generation change with no reopen failure. It then sends more than six maximum
 physical-read batches in the reverse direction, including every byte value and
 escaped `0xff` bytes, and requires the CCPLEX PTY to receive the original
 logical payload exactly. This also guards the batched parser/routing path.
+
+### CP2108 silent receive recovery
+
+Silent receive monitoring and recovery are enabled automatically for CP2108
+(VID/PID 10c4:ea71, confirmed part 0x08); no command-line option is needed. The
+physical RX thread derives the interface and USB address from sysfs and reads
+GET_COMM_STATUS over usbfs without detaching the kernel driver. It requires
+write access to the matching `/dev/bus/usb` node. Other chips and PTYs retain
+their existing behavior.
+
+After two seconds without physical RX, the monitor samples at most once per
+second with a 100 ms USB timeout. It requires a nonempty device receive queue,
+an empty tty input queue and no reported DSR receive hold across a further two
+seconds before requesting recovery. Idle, short replies, failed queries and tty
+backlog are not recovery triggers. Status error flags are not used as a trigger;
+queries may consume diagnostic error indications.
+
+RX invokes the existing TX-synchronized physical tty replacement, preserving the
+process, client PTYs and accepted software queues. The CP2108 close path purges
+device queues: this is recovery after a transport failure, not lossless replay.
+RAW retains bytes that were actually read; VSER routing is quarantined until the
+next valid tag or reset so stale tags or half escapes cannot route data to the
+wrong client. A successful open is not reported as recovered RX: only actual
+received bytes confirm progress. Without progress, retry intervals increase
+through 5, 10, 20, 40 and 60 seconds and stay at 60 seconds.
+
+This does not prevent the initial USB error and cannot recover a device that
+continues stalling after UART close/open. In that case retries remain bounded
+and the recovery log must not be interpreted as restored console traffic.
+
+`make check` includes deterministic status/idle/flow-control/backoff tests and a
+real-PTY regression that injects only the stall decision, with no HUP. The
+latter checks same-process recovery, preservation of an already open client,
+RX/TX delivery, and parser quarantine across an interrupted escape sequence.
