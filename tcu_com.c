@@ -287,6 +287,10 @@ struct thread_data
     unsigned long long output_bytes;
     unsigned long long output_eagain;
     unsigned long long output_overflows;
+    unsigned long long output_rejected_bytes;
+    unsigned long long output_gap_rejected_bytes;
+    unsigned long long output_overflow_recoveries;
+    bool output_overflow_paused;
     unsigned long long output_log_errors;
     unsigned long long output_shutdown_dropped;
     unsigned long long input_bytes;
@@ -684,14 +688,17 @@ static void report_output_stats(const char *reason)
                 "INFO: VSER %u output stats: bytes=%llu queued=%zu high_water=%zu "
                 "eagain=%llu overflows=%llu log_errors=%llu "
                 "shutdown_dropped=%llu unhealthy=%u "
-                "input_bytes=%llu input_reads=%llu\n",
+                "input_bytes=%llu input_reads=%llu rejected_bytes=%llu "
+                "overflow_paused=%u overflow_recoveries=%llu\n",
                 pty->id, pty->output_bytes, pty->output_queue_length,
                 pty->output_queue_high_water, pty->output_eagain,
                 pty->output_overflows, pty->output_log_errors,
                 pty->output_shutdown_dropped,
                 pty->output_unhealthy,
                 __atomic_load_n(&pty->input_bytes, __ATOMIC_RELAXED),
-                __atomic_load_n(&pty->input_reads, __ATOMIC_RELAXED));
+                __atomic_load_n(&pty->input_reads, __ATOMIC_RELAXED),
+                pty->output_rejected_bytes, pty->output_overflow_paused,
+                pty->output_overflow_recoveries);
         pthread_mutex_unlock(&pty->output_lock);
     }
 
@@ -785,6 +792,10 @@ ut_static int init_pty_output_queue(struct thread_data *pty, size_t capacity)
     pty->output_bytes = 0;
     pty->output_eagain = 0;
     pty->output_overflows = 0;
+    pty->output_rejected_bytes = 0;
+    pty->output_gap_rejected_bytes = 0;
+    pty->output_overflow_recoveries = 0;
+    pty->output_overflow_paused = false;
     pty->output_log_errors = 0;
     pty->output_shutdown_dropped = 0;
     pty->input_bytes = 0;
@@ -816,6 +827,26 @@ ut_static void destroy_pty_output_queue(struct thread_data *pty)
     pty->output_queue = NULL;
 }
 
+/* Caller holds output_lock. A gap is never hidden by resetting counters or
+ * evicting the accepted prefix. Only resume after that prefix has drained, so
+ * the recovery log identifies a stable byte boundary on the same PTY. */
+static void resume_pty_output_locked(struct thread_data *pty)
+{
+    if (!pty->output_overflow_paused || pty->output_queue_length != 0 ||
+        pty->output_unhealthy)
+        return;
+
+    pty->output_overflow_paused = false;
+    pty->output_overflow_recoveries++;
+    fprintf(stderr,
+            "WARNING: VSER %u output resumed after overflow: accepted_bytes=%llu "
+            "gap_rejected_bytes=%llu total_rejected_bytes=%llu recoveries=%llu; "
+            "stream contains a data gap.\n",
+            pty->id, pty->output_bytes, pty->output_gap_rejected_bytes,
+            pty->output_rejected_bytes, pty->output_overflow_recoveries);
+    pty->output_gap_rejected_bytes = 0;
+}
+
 ut_static int enqueue_pty_output(struct thread_data *pty,
                                  const unsigned char *data, size_t len)
 {
@@ -824,19 +855,32 @@ ut_static int enqueue_pty_output(struct thread_data *pty,
 
     pthread_mutex_lock(&pty->output_lock);
     if (pty->output_unhealthy) {
+        pty->output_rejected_bytes += len;
         pthread_mutex_unlock(&pty->output_lock);
         return -EIO;
     }
-    /* Never evict old bytes: eviction would create a plausible-looking but
-     * corrupt stream. Isolate and report only the affected VSER. */
+    resume_pty_output_locked(pty);
+    if (pty->output_overflow_paused) {
+        pty->output_rejected_bytes += len;
+        pty->output_gap_rejected_bytes += len;
+        pthread_mutex_unlock(&pty->output_lock);
+        return -ENOSPC;
+    }
+    /* Preserve the accepted prefix and pause only this sink until it drains.
+     * Loss is explicit; no shared stop or PTY replacement is required. */
     if (len > pty->output_queue_capacity - pty->output_queue_length) {
         pty->output_overflows++;
-        pty->output_unhealthy = true;
+        pty->output_rejected_bytes += len;
+        pty->output_gap_rejected_bytes += len;
+        pty->output_overflow_paused = true;
         fprintf(stderr,
                 "ERROR: VSER %u output queue overflow: queued=%zu requested=%zu "
-                "capacity=%zu; isolating this VSER.\n",
+                "capacity=%zu; pausing this VSER until its accepted prefix drains.\n",
                 pty->id, pty->output_queue_length, len,
                 pty->output_queue_capacity);
+        /* An oversized batch can fail even with an empty queue. It must not
+         * leave admission paused forever with no bytes for a worker to drain. */
+        resume_pty_output_locked(pty);
         pthread_mutex_unlock(&pty->output_lock);
         return -ENOSPC;
     }
@@ -1006,6 +1050,7 @@ ut_static void *pty_output_handler(void *arg)
                                  pty->output_queue_capacity;
         pty->output_queue_length -= (size_t)written;
         pty->output_bytes += (unsigned long long)written;
+        resume_pty_output_locked(pty);
         pthread_mutex_unlock(&pty->output_lock);
     }
     return NULL;
@@ -2102,7 +2147,10 @@ not_escape_ch:
                 continue;
             ret_val = enqueue_pty_output(&pty_data[index], batches[index].data,
                                          batches[index].length);
-            if (ret_val < 0)
+            /* Overflow pauses only this destination; fatal sink errors also
+             * stay local. Parser/batch and physical failures remain terminal.
+             * Keep routing healthy sinks later in this same physical read. */
+            if (ret_val < 0 && ret_val != -ENOSPC && ret_val != -EIO)
                 goto route_failed;
         }
         continue;
