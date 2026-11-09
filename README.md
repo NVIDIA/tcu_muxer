@@ -27,6 +27,12 @@ preserves short-write suffixes, and isolates a stalled channel behind its own
 bounded queue. Queue overflow is reported and marks that VSER unhealthy; bytes
 are never silently evicted.
 
+Disconnected consumers retain queued data. Output polling checks terminal
+events before writable readiness, with a 100 ms delay independent of the PTY
+on `POLLHUP`/`POLLERR`. This prevents immediate HUP wakeups from consuming a
+CPU. `POLLNVAL` and fatal poll errors isolate that sink. Poll waits and retry
+delays are bounded to 100 ms so shutdown remains responsive.
+
 The same VSER worker owns persistent console logging. Timestamp formatting is
 accumulated in a 16 KiB buffer and flushed once per PTY batch, avoiding
 synchronous per-character filesystem writes during RAS/UCF bursts while
@@ -167,7 +173,7 @@ make clean
 make
 ```
 
-Run the process-level regression with:
+Run the regressions with:
 
 ```bash
 make check
@@ -182,6 +188,10 @@ generation change with no reopen failure. It then sends more than six maximum
 physical-read batches in the reverse direction, including every byte value and
 escaped `0xff` bytes, and requires the CCPLEX PTY to receive the original
 logical payload exactly. This also guards the batched parser/routing path.
+
+The PTY output regression exercises HUP (including HUP + POLLOUT), ERR,
+NVAL, EINTR, timeout and poll failure, bounded stop, real disconnected-PTY
+CPU use and ordered reconnection.
 
 ### CP2108 silent receive recovery
 

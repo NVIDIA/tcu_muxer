@@ -9,6 +9,12 @@ executable(
 )
 
 if get_option('tests').allowed()
+    pty_test = executable(
+        'tcu_muxer_pty_test',
+        ['tests/test_pty_output.c', 'raw_capture.c', 'rx_stall.c'],
+        dependencies: thread_dep,
+    )
+    test('pty-output-retry-and-reconnect', pty_test, timeout: 20)
     python = find_program('python3')
     hup_test_muxer = executable(
         'tcu_muxer_hup_test',

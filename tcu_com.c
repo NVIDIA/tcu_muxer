@@ -105,6 +105,8 @@ int uucp_lock_tty_device(void);
 /* A stalled console is isolated behind its own bounded queue. The physical
  * UART reader must never block on a PTY consumer or silently discard EAGAIN. */
 #define PTY_OUTPUT_QUEUE_SIZE (1024U * 1024U)
+/* Bound stop latency and retry disconnected PTYs without polling a HUP fd. */
+#define PTY_OUTPUT_RETRY_MS 100
 
 ut_static bool tcu_muxer_started = true; // Needed to exit endless while loops during testing
 ut_static volatile sig_atomic_t output_stats_requested;
@@ -854,6 +856,18 @@ ut_static int enqueue_pty_output(struct thread_data *pty,
     return 0;
 }
 
+static void wait_pty_output_retry(void)
+{
+    struct timespec delay = { .tv_sec = 0,
+                             .tv_nsec = PTY_OUTPUT_RETRY_MS * 1000000L };
+
+    /* Producer signals must not shorten this delay. A disconnected master
+     * reports HUP immediately even when POLLOUT was requested. */
+    while (is_tcu_muxer_started() && nanosleep(&delay, &delay) < 0 &&
+           errno == EINTR)
+        ;
+}
+
 ut_static void *pty_output_handler(void *arg)
 {
     struct thread_data *pty = arg;
@@ -924,13 +938,31 @@ ut_static void *pty_output_handler(void *arg)
             pthread_mutex_lock(&pty->output_lock);
             pty->output_eagain++;
             pthread_mutex_unlock(&pty->output_lock);
-            do {
-                poll_status = poll(&pfd, 1, poll_output_timeout);
-            } while (poll_status < 0 && errno == EINTR &&
-                     is_tcu_muxer_started());
-            /* Re-enter the top of the loop so a concurrent stop request uses
-             * the bounded-shutdown path and accounts for the complete queue. */
-            continue;
+            poll_status = poll(&pfd, 1, PTY_OUTPUT_RETRY_MS);
+            if (poll_status < 0) {
+                if (errno == EINTR)
+                    continue;
+                fprintf(stderr, "ERROR: VSER %u output poll failed: %s; "
+                        "isolating this VSER.\n", pty->id, strerror(errno));
+            } else if (poll_status > 0 && (pfd.revents & POLLNVAL)) {
+                fprintf(stderr, "ERROR: VSER %u output descriptor invalid; "
+                        "isolating this VSER.\n", pty->id);
+            } else {
+                /* Terminal events take precedence over POLLOUT. Keep the
+                 * accepted prefix intact so a returning reader can drain it.
+                 * Sleep independently of the fd: HUP/ERR are level-triggered
+                 * and would otherwise cause an immediate write/poll spin. */
+                if (poll_status > 0 &&
+                    ((pfd.revents & (POLLHUP | POLLERR)) ||
+                     !(pfd.revents & POLLOUT)))
+                    wait_pty_output_retry();
+                /* Timeout already waited. Recheck stop at the loop head. */
+                continue;
+            }
+            pthread_mutex_lock(&pty->output_lock);
+            pty->output_unhealthy = true;
+            pthread_mutex_unlock(&pty->output_lock);
+            break;
         }
         if (written < 0 && errno == EINTR)
             continue;
