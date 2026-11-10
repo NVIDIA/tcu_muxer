@@ -42,6 +42,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include "raw_capture.h"
+#include "rx_stall.h"
 #include "uart-proto.h"
 
 struct reply_ctx {
@@ -1654,13 +1655,14 @@ static void handle_stop_request(int sig)
 
 ut_static int uucp_set_filelock_name(void)
 {
+    const char *device_name;
     char *ptr;
     char buf[MAX_PATH];
     int ret, len, i;
 
-    ptr = strchr(tty_device + 1, '/');
-    ptr = ptr ? ptr + 1 : (char*)tty_device;
-    strncpy(buf, ptr, sizeof(buf) - 1);
+    device_name = strchr(tty_device + 1, '/');
+    device_name = device_name ? device_name + 1 : tty_device;
+    strncpy(buf, device_name, sizeof(buf) - 1);
     ptr = buf;
     len = strlen(ptr);
     for (i = 0; i < len; i++) {
@@ -1833,6 +1835,7 @@ void* tty_input_handler(void *arg)
     (void)arg;
     unsigned char *buf = NULL;
     struct rx_route_batch *batches = NULL;
+    struct rx_stall rx_watch = { .usb_fd = -1 };
     struct pollfd pfd;
 
     unsigned char ch;
@@ -1870,6 +1873,8 @@ void* tty_input_handler(void *arg)
         goto out;
     }
 
+    rx_stall_init(&rx_watch, tty_data.fd);
+
     while (is_tcu_muxer_started()) {
         /* TX may observe descriptor loss before RX does. Service its request
          * before polling again so the TX worker is not left waiting for a
@@ -1880,6 +1885,7 @@ void* tty_input_handler(void *arg)
                 request_muxer_stop();
                 goto out;
             }
+            rx_stall_refresh(&rx_watch, tty_data.fd);
             continue;
         }
         pfd.fd = tty_data.fd;
@@ -1893,8 +1899,25 @@ void* tty_input_handler(void *arg)
 
         if (should_retry_io(ret_val))
             continue;
-        if (ret_val == 0)
+        if (ret_val == 0) {
+            if (rx_stall_check(&rx_watch, tty_data.fd)) {
+                /* close purges CP2108 queues. A lost tag or half an escape
+                 * invalidates our old routing context: retain RAW evidence,
+                 * but resume VSER routing only at a valid tag/reset.
+                 */
+                in_escape = false;
+                routing_synchronized = false;
+                memset(seen_n, 0, sizeof(seen_n));
+                memset(seen_r, 0, sizeof(seen_r));
+                if (reopen_physical_tty() < 0) {
+                    fprintf(stderr, "ERROR: RX stall recovery could not reopen tty\n");
+                    request_muxer_stop();
+                    goto out;
+                }
+                rx_stall_refresh(&rx_watch, tty_data.fd);
+            }
             continue;
+        }
         assert(ret_val == 1);
 
         if (pfd.revents & (POLLHUP|POLLERR|POLLNVAL)) {
@@ -1906,6 +1929,7 @@ void* tty_input_handler(void *arg)
                 goto out;
 #endif
             if (reopen_physical_tty() == 0) {
+                rx_stall_refresh(&rx_watch, tty_data.fd);
                 continue;
             } else {
                 fprintf(stderr, "ERROR: tty_input_handler: hangup\n");
@@ -1918,14 +1942,18 @@ void* tty_input_handler(void *arg)
         if (len < 0) {
             if (errno == EBADF || errno == ENODEV || errno == ENXIO ||
                 errno == EIO) {
-                if (reopen_physical_tty() == 0)
+                if (reopen_physical_tty() == 0) {
+                    rx_stall_refresh(&rx_watch, tty_data.fd);
                     continue;
+                }
             }
             fprintf(stderr, "ERROR: failed to read\n");
             request_muxer_stop();
             goto out;
         }
         if (len > 0) {
+            if (rx_watch.usb_fd >= 0)
+                rx_stall_progress(&rx_watch);
             /* Capture the exact successful physical read before raw logging,
              * framing, routing, timestamping, or PTY backpressure. */
             raw_capture_record(buf, (size_t)len);
@@ -2054,6 +2082,7 @@ route_failed:
         goto out;
     }
 out:
+    rx_stall_close(&rx_watch);
     if (batches)
         free(batches);
     if (buf)
