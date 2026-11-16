@@ -24,8 +24,25 @@ avoiding a mutex operation and worker wakeup for every character. It then
 returns promptly to `/dev/ttyUSB*` instead of waiting for a PTY consumer or
 demultiplexed log write. Each VSER worker retries `EINTR` and `EAGAIN`,
 preserves short-write suffixes, and isolates a stalled channel behind its own
-bounded queue. Queue overflow is reported and marks that VSER unhealthy; bytes
-are never silently evicted.
+bounded queue. Queue overflow pauses only that VSER's admission while its
+accepted prefix drains; healthy VSERs continue routing. New data arriving during
+that pause is rejected and counted in `rejected_bytes`. Once its queue is empty,
+the worker resumes admission automatically on the same PTY without restarting
+the muxer or affecting other consoles. No accepted bytes are evicted.
+
+Each overflow and recovery is reported on stderr, including the rejected-byte
+count and accepted-byte boundary. A recovered stream contains a data gap; raw
+bytes are not modified with inline markers. Historical `overflows`,
+`rejected_bytes`, and `overflow_recoveries` remain visible in SIGUSR1/shutdown
+statistics, while `overflow_paused` shows the current admission state. Recovery
+does not claim that the stream is complete. Fatal output/log errors remain
+unhealthy and are distinct from recoverable queue saturation.
+
+Disconnected consumers retain queued data. Output polling checks terminal events
+before writable readiness, with a 100 ms delay independent of the PTY on
+`POLLHUP`/`POLLERR`. This prevents immediate HUP wakeups from consuming a CPU.
+`POLLNVAL` and fatal poll errors isolate that sink. Poll waits and retry delays
+are bounded to 100 ms so shutdown remains responsive.
 
 The same VSER worker owns persistent console logging. Timestamp formatting is
 accumulated in a 16 KiB buffer and flushed once per PTY batch, avoiding
@@ -167,7 +184,7 @@ make clean
 make
 ```
 
-Run the process-level regression with:
+Run the regressions with:
 
 ```bash
 make check
@@ -182,6 +199,15 @@ generation change with no reopen failure. It then sends more than six maximum
 physical-read batches in the reverse direction, including every byte value and
 escaped `0xff` bytes, and requires the CCPLEX PTY to receive the original
 logical payload exactly. This also guards the batched parser/routing path.
+
+The PTY output regression exercises HUP (including HUP + POLLOUT), ERR, NVAL,
+EINTR, timeout and poll failure, bounded stop, real disconnected-PTY CPU use and
+ordered reconnection.
+
+Overflow regressions also verify healthy CCPLEX routing past PSC/RAW failures,
+oversized admissions on empty queues, and two full overflow/reconnect/recovery
+cycles on the same real PTY and worker, with exact prefix order, resumed data,
+rejected-byte accounting and no muxer restart.
 
 ### CP2108 silent receive recovery
 

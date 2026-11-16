@@ -4,3 +4,4 @@ tcu_muxer_integration
 __pycache__/
 tcu_muxer_rx_stall_test
 tcu_muxer_stall_fixture
+tcu_muxer_pty_test
